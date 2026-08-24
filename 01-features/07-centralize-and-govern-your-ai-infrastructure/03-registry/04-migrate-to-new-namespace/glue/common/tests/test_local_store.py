@@ -79,6 +79,18 @@ class RunIdsCannotBeSilentlyReused(unittest.TestCase):
             self.store.put_json_if_absent(key, {})
         self.assertIn(str(Path(self.temp.name).resolve()), str(caught.exception))
 
+    @unittest.skipUnless(os.name == "nt", "Windows path behavior only")
+    def test_a_lock_at_the_windows_maximum_path_length_is_written(self):
+        root = str(Path(self.temp.name).resolve())
+        prefix = "state/locks/run_id=r1/"
+        filename_length = 260 - len(root) - len(prefix)
+        if filename_length < 1:
+            self.skipTest("temporary directory path is already too long")
+        key = prefix + ("x" * filename_length)
+        self.assertEqual(len(str(Path(root) / key)), 260)
+        self.store.put_json_if_absent(key, {"runId": "r1"})
+        self.assertEqual(self.store.get_json(key), {"runId": "r1"})
+
 
 class StagedBytesArePinned(unittest.TestCase):
     """The load stage reconciles staged data against the manifest before it processes anything.

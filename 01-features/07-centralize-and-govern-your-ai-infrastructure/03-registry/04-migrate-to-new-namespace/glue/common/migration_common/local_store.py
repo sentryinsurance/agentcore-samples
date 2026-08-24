@@ -56,14 +56,24 @@ class LocalStore:
             raise ValueError(f"Refusing to touch {candidate}, which is outside {self.root}")
         return candidate
 
+    @staticmethod
+    def _native_path(path: Path) -> str:
+        value = os.fspath(path)
+        if os.name != "nt" or value.startswith("\\\\?\\"):
+            return value
+        if value.startswith("\\\\"):
+            return "\\\\?\\UNC\\" + value[2:]
+        return "\\\\?\\" + value
+
     def _write_bytes(self, key: str, body: bytes) -> Path:
         path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(self._native_path(path.parent), exist_ok=True)
         # Write to a sibling temp file and replace, so a reader never sees a half-written report and
         # an interrupted run leaves the previous content intact.
         temporary = path.with_name(f".{path.name}.partial")
-        temporary.write_bytes(body)
-        os.replace(temporary, path)
+        with open(self._native_path(temporary), "wb") as handle:
+            handle.write(body)
+        os.replace(self._native_path(temporary), self._native_path(path))
         return path
 
     # -- writes ------------------------------------------------------------------------------
@@ -78,9 +88,9 @@ class LocalStore:
     def put_json_if_absent(self, key: str, value: Any) -> None:
         """Write JSON only if ``key`` does not exist yet (the run/attempt lock)."""
         path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(self._native_path(path.parent), exist_ok=True)
         try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            descriptor = os.open(self._native_path(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError as error:
             raise RuntimeError(f"Immutable local file already exists: {path}") from error
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -116,20 +126,25 @@ class LocalStore:
         """
         head, separator, _ = prefix.rpartition("/")
         base = self._path(head) if separator else self.root
-        if not base.is_dir():
+        native_base = self._native_path(base)
+        if not os.path.isdir(native_base):
             return []
         keys: list[str] = []
-        for path in base.rglob("*"):
-            if path.is_symlink() or not path.is_file():
-                continue
-            key = path.relative_to(self.root).as_posix()
-            if key.startswith(prefix):
-                keys.append(key)
+        native_root = self._native_path(self.root)
+        for directory, _subdirectories, filenames in os.walk(native_base):
+            for filename in filenames:
+                native_path = os.path.join(directory, filename)
+                if os.path.islink(native_path):
+                    continue
+                key = os.path.relpath(native_path, native_root).replace(os.sep, "/")
+                if key.startswith(prefix):
+                    keys.append(key)
         return sorted(keys)
 
     def get_json(self, key: str) -> Any:
         """Read and JSON-decode the file at ``key``."""
-        return json.loads(self._path(key).read_text(encoding="utf-8"))
+        with open(self._native_path(self._path(key)), encoding="utf-8") as handle:
+            return json.load(handle)
 
     def get_json_if_present(self, key: str) -> Any:
         """Read and JSON-decode the file at ``key``, or return ``None`` when it does not exist."""
@@ -142,12 +157,13 @@ class LocalStore:
         """Recompute a staged file's count, hash and size from what is on disk right now."""
         key = _required_text(expected, "key")
         path = self._path(key)
-        if not path.is_file():
+        native_path = self._native_path(path)
+        if not os.path.isfile(native_path):
             raise RuntimeError(f"Staged object is missing: {path}")
         digest = hashlib.sha256()
         size_bytes = 0
         record_count = 0
-        with path.open("rb") as handle:
+        with open(native_path, "rb") as handle:
             for line in handle:
                 digest.update(line)
                 size_bytes += len(line)
@@ -176,7 +192,7 @@ class LocalStore:
         for expected in objects:
             key = _required_text(expected, "key")
             path = self._path(key)
-            with path.open("r", encoding="utf-8") as handle:
+            with open(self._native_path(path), encoding="utf-8") as handle:
                 for raw_line in handle:
                     if not raw_line.strip():
                         continue
